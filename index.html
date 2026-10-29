@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en" manifest="cache.appcache">
 <head>
@@ -5,29 +6,40 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ps4 jailbreak</title>
 <style>
-  html, body { margin:0; padding:0; background:#0b0d10; color:#c8ced8;
-               font:15px/1.45 "Segoe UI", system-ui, sans-serif; }
-  #wrap { padding:16px 18px; }
-  #state { font-size:22px; font-weight:700; margin:0 0 6px; }
-  #det { font-size:13px; color:#8b95a3; margin:0 0 4px; }
-  #det b { color:#c8ced8; font-weight:600; }
-  #cache { font-size:12px; color:#5c6672; margin:0 0 10px; min-height:14px; }
-  #cache.cacheok { color:#7fd0a0; }
-  .ok { color:#7fd0a0; } .bad { color:#d08a7f; } .warn { color:#d8c07f; }
-  #brand { text-align:center; padding:8px 10px; background:#0e1116;
-           border-bottom:1px solid #1e2732; }
-  #brand img { width:28px; height:28px; margin-right:8px; border-radius:50%;
-               vertical-align:middle; }
-  #brand b { font-size:15px; font-weight:700; letter-spacing:.14em;
-             color:#e6ebf2; vertical-align:middle; }
+    html, body { margin:0; padding:0; background:#0b0d10; color:#c8ced8;
+                 font:15px/1.45 "Segoe UI", system-ui, sans-serif; }
+    #wrap { padding:16px 18px; }
+    #state { font-size:22px; font-weight:700; margin:0 0 6px; }
+    #det { font-size:13px; color:#8b95a3; margin:0 0 4px; }
+    #det b { color:#c8ced8; font-weight:600; }
+    #cache { font-size:12px; color:#5c6672; margin:0 0 10px; min-height:14px; }
+    #cache.cacheok { color:#7fd0a0; }
+    .ok { color:#7fd0a0; } .bad { color:#d08a7f; } .warn { color:#d8c07f; }
+    #brand { text-align:center; padding:8px 10px; background:#0e1116;
+             border-bottom:1px solid #1e2732; }
+    #brand img { width:28px; height:28px; margin-right:8px; border-radius:50%;
+                 vertical-align:middle; }
+    #brand b { font-size:15px; font-weight:700; letter-spacing:.14em;
+               color:#e6ebf2; vertical-align:middle; }
+
+    body {
+        background-image: url('background.png');
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+        background-color: #111; /* لون احتياطي في حال تأخر تحميل الصورة */
+        color: #fff;
+        font-family: Arial, sans-serif;
+    }
 </style>
 </head>
 <body>
 <div id="brand"><img src="logo_raw.png" alt="" width="28" height="28"><b>SHADY & ELYAS GAMES</b></div>
 <div id="wrap">
-  <div id="state">detecting firmware...</div>
-  <div id="det"></div>
-  <div id="cache"></div>
+    <div id="state">detecting firmware...</div>
+    <div id="det"></div>
+    <div id="cache"></div>
 </div>
 
 <script>
@@ -40,7 +52,7 @@
     var params = new URLSearchParams(location.search);
 
     var key = null, fwnum = null;
-    var m = /PlayStation\s+4[\/ ](\d+)\.(\d+)/.exec(navigator.userAgent);
+    var m = /PlayStation\s+4[\\/ ](\d+)\.(\d+)/.exec(navigator.userAgent);
     if (m) {
         var minor = parseInt(m[2], 16);
         var ms = minor.toString(16);
