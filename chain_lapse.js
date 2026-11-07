@@ -1,4 +1,4 @@
-import { establishPrimitive } from "./core.js";
+import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP } from "./mem.js";
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets.js";
@@ -296,7 +296,7 @@ function makeRpc(worker) {
                     + (detail || ''));
             }
         });
-        installWindowP(carrier);
+        installWindowP(carrier, { promote: false });
         if (!window.p) throw new Error("window.p was not installed");
         p = window.p;
         mark("PRIMITIVE-OK", "");
