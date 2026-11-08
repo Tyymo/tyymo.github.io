@@ -141,6 +141,96 @@ let allDone = false;
             + " spray=" + NUM_IOV_SPRAY
             + " mode=" + (STOP_BEFORE_DOUBLE ? "stop-before-double" : "armed"));
 
+        // EARLY DIRTY-LOCK GATE. Checked right after the firmware and offsets
+        // are validated, and BEFORE any kpatch/payload fetch, primitive,
+        // carrier, worker, socket, pipe, affinity or rtprio work. A refused
+        // run therefore allocates and touches nothing. The key is written
+        // later, immediately before the first operation that can start UAF.
+        const UAF_DIRTY_KEY = "ps4lab_uaf_dirty";
+
+        function renderDirtyLockClear(key, value) {
+            try {
+                const box = document.createElement("div");
+                box.style.cssText = "margin:12px 0;padding:10px;"
+                    + "border:1px solid #5a2a2a;border-radius:5px;"
+                    + "background:rgba(40,16,16,0.6);";
+                const p = document.createElement("div");
+                p.textContent = "A previous run reached the UAF stage on this "
+                    + "PS4. Power the console fully off and back on, then "
+                    + "confirm below. Do NOT confirm unless the PS4 was fully "
+                    + "restarted.";
+                const b = document.createElement("button");
+                b.type = "button";
+                b.textContent = "I fully restarted the PS4 -- clear the dirty lock";
+                b.style.cssText = "margin-top:8px;padding:6px 10px;"
+                    + "font:inherit;cursor:pointer;";
+                b.onclick = function () {
+                    if (!window.confirm("Only confirm if you have FULLY powered "
+                        + "off and restarted the PS4. Clearing the lock without a "
+                        + "real reboot can run UAF on a poisoned kernel. Continue?"))
+                        return;
+                    let after = null;
+                    try {
+                        localStorage.removeItem(key);
+                        after = localStorage.getItem(key);
+                    } catch (e) {
+                        mark("UAF-DIRTY-CLEAR-THREW",
+                            (e && e.message) ? e.message : String(e));
+                        state("CLEAR FAILED -- dirty lock still present", "bad");
+                        return;
+                    }
+                    if (after === null) {
+                        mark("UAF-DIRTY-CLEARED", "key=" + key
+                            + " previous=" + value + " verified=removed");
+                        state("Lock cleared. Reload this page to start a new run.",
+                            "warn");
+                        b.disabled = true;
+                        b.textContent = "Lock cleared -- reload the page";
+                    } else {
+                        mark("UAF-DIRTY-CLEAR-MISMATCH",
+                            "key=" + key + " after=" + after);
+                        state("CLEAR FAILED -- dirty lock still present", "bad");
+                    }
+                };
+                box.appendChild(p);
+                box.appendChild(b);
+                const host = stateEl.parentNode || document.body;
+                const anchor = (stateEl.parentNode === host)
+                    ? stateEl.nextSibling : null;
+                host.insertBefore(box, anchor);
+            } catch (e) {
+                mark("UAF-DIRTY-UI-THREW",
+                    (e && e.message) ? e.message : String(e));
+                state("REBOOT PS4 REQUIRED -- clear ps4lab_uaf_dirty manually",
+                    "bad");
+            }
+        }
+
+        let uafDirtySeen = null;
+        let uafDirtyReadOk = true;
+        try { uafDirtySeen = localStorage.getItem(UAF_DIRTY_KEY); }
+        catch (e) {
+            uafDirtyReadOk = false;
+            mark("UAF-DIRTY-READ-THREW",
+                (e && e.message) ? e.message : String(e));
+        }
+        if (!uafDirtyReadOk) {
+            mark("UAF-DIRTY-READ-FAILED",
+                "reason=localStorage-unavailable -- refusing to arm");
+            state("CANNOT READ UAF DIRTY LOCK -- ABORTING", "bad");
+            mark("PROOF-SUMMARY-FINAL", "pass=" + passCount + " fail=" + failCount);
+            return;
+        }
+        if (uafDirtySeen !== null) {
+            mark("UAF-DIRTY-LOCKED", "key=" + UAF_DIRTY_KEY
+                + " value=" + uafDirtySeen
+                + " reason=a-previous-run-reached-uaf");
+            state("REBOOT PS4 REQUIRED -- UAF dirty lock is set", "bad");
+            renderDirtyLockClear(UAF_DIRTY_KEY, uafDirtySeen);
+            mark("PROOF-SUMMARY-FINAL", "pass=" + passCount + " fail=" + failCount);
+            return;
+        }
+
         let kpatch = null, payload = null;
         // off.kpatch wins when a firmware shares another's kernel and therefore
         // its blob -- 12.02 uses 1200.bin. Otherwise derive it from the key.
@@ -1144,8 +1234,45 @@ let allDone = false;
             mark("PROOF-SUMMARY-FINAL", "pass=" + passCount + " fail=" + failCount);
             return;
         }
-        check("console-rebooted-since-last-committed", true,
-            "boot=" + (boot || "none") + " last=" + (lastCommitted || "none"));
+        if (boot) {
+            check("console-rebooted-since-last-committed", lastCommitted !== boot,
+                "boot=" + boot + " last=" + (lastCommitted || "none"));
+        } else {
+            // bootFingerprint() returned null: there is NO boot identity.
+            // This is not evidence of a reboot. The permanent dirty lock
+            // below is the only gate that survives a browser restart.
+            mark("BOOT-UNPROVEN", "reason=no-boot-identity " + bootErr
+                + " -- manual reboot confirmation required");
+        }
+
+        // The permanent dirty lock is written before the first operation that
+        // can start the UAF and is never cleared by success, failure, cleanup,
+        // finally, internal retries or a page close. force=1 is not consulted
+        // here. Only the explicit manual button from the early gate clears it.
+        let uafDirtyWritten = false;
+
+        function writeUafDirtyLock() {
+            if (uafDirtyWritten) return true;
+            const token = "uaf-" + Date.now() + "-"
+                + Math.random().toString(36).slice(2);
+            try {
+                localStorage.setItem(UAF_DIRTY_KEY, token);
+                const back = localStorage.getItem(UAF_DIRTY_KEY);
+                if (back !== token) {
+                    mark("UAF-DIRTY-WRITE-MISMATCH",
+                        "wrote=" + token + " read=" + back);
+                    return false;
+                }
+                uafDirtyWritten = true;
+                mark("UAF-DIRTY-LOCK-SET", "key=" + UAF_DIRTY_KEY
+                    + " value=" + token);
+                return true;
+            } catch (e) {
+                mark("UAF-DIRTY-WRITE-FAILED",
+                    (e && e.message) ? e.message : String(e));
+                return false;
+            }
+        }
 
         let twins = null, triplets = null;
 
@@ -1169,6 +1296,16 @@ let allDone = false;
             if (reg.rv === -1) {
                 mark("ATTEMPT-SKIP", "SET_QUEUE rv=-1 errno=" + reg.err);
                 sc(SYS.close, dummy); continue;
+            }
+
+            // The next statement closes the dummy socket and reuses its fd:
+            // that is where the UAF begins. Persist the permanent dirty lock
+            // first. If it cannot be written and read back, stop here.
+            if (!writeUafDirtyLock()) {
+                mark("UAF-DIRTY-WRITE-ABORT", "reason=cannot-persist-lock");
+                state("CANNOT PERSIST UAF DIRTY LOCK -- ABORTING BEFORE UAF",
+                    "bad");
+                return;
             }
 
             sc(SYS.close, dummy);
@@ -1385,7 +1522,9 @@ let allDone = false;
                         const kbNow = "" + kernelBase;
                         const kbLast = localStorage.getItem("ps4lab_kernel_base");
                         if (kbLast === kbNow)
-                            mark("SAME-BOOT-AS-LAST-RUN", "kernel_base=" + kbNow);
+                            mark("KERNEL-BASE-MATCHES-PREVIOUS",
+                                "kernel_base=" + kbNow
+                                + " diagnostic-only=1 not-a-boot-identity");
                         localStorage.setItem("ps4lab_kernel_base", kbNow);
                     } catch (e) { }
 
