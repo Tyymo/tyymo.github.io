@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>HTTPS connection check</title></head>
+<body><h1>HTTPS connection check</h1>
+<p>Receiver: https://ps4diag.duckdns.org:8766</p>
+<button id="send" type="button">Send one test event</button>
+<pre id="result">Idle. No request sent.</pre>
+<script>
+(function () {
+ var button = document.getElementById('send');
+ var result = document.getElementById('result');
+ var sent = false;
+ button.onclick = function () {
+  if (sent) { return; }
+  if (location.protocol !== 'https:' || location.host !== 'tyymo.github.io') {
+   result.textContent = 'Requires https://tyymo.github.io. No request sent.';
+   return;
+  }
+  sent = true;
+  button.disabled = true;
+  var xhr = new XMLHttpRequest();
+  var start = new Date().getTime();
+  xhr.open('GET', 'https://ps4diag.duckdns.org:8766/probe-a73f/event?t=' + start, true);
+  xhr.timeout = 5000;
+  xhr.onload = function () { result.textContent = 'HTTP ' + xhr.status + '\n' + xhr.responseText + '\nElapsed ms: ' + (new Date().getTime() - start); };
+  xhr.onerror = function () { result.textContent = 'TLS/network/CORS failure; inspect receiver log.'; };
+  xhr.ontimeout = function () { result.textContent = 'Timeout; inspect receiver log.'; };
+  try { xhr.send(null); } catch (error) { result.textContent = String(error); }
+ };
+}());
+</script></body></html>
